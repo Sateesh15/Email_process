@@ -61,7 +61,7 @@ class AIEnhancedTextExtractor {
         this.skillCategories = {
             programming: [
                 'JavaScript', 'Python', 'Java', 'C++', 'C#', 'PHP', 'Ruby', 'Go', 'Rust', 'TypeScript',
-                'Swift', 'Kotlin', 'Scala', 'R', 'MATLAB', 'Dart', 'Objective-C', 'Perl', 'Haskell'
+                'Swift', 'Kotlin', 'Scala', 'MATLAB', 'Dart', 'Objective-C', 'Perl', 'Haskell'
             ],
             web: [
                 'React', 'Angular', 'Vue.js', 'Vue', 'Node.js', 'Express', 'Django', 'Flask', 'Spring',
@@ -185,15 +185,27 @@ class AIEnhancedTextExtractor {
             .join(' ');
     }
 
-    // Enhanced experience extraction with date calculation
+    // Enhanced experience extraction with date calculation and summary analysis
     extractExperienceWithAI(text) {
-        // Look for explicit experience mentions
+        // Strategy 1: Look in the summary/profile section for experience
+        const summaryPattern = /(?:with|having)\s+(\d+(?:\.\d+)?)\s*(?:\+\s*)?years?\s+(?:of\s+)?(?:work\s+)?experience/i;
+        const summaryMatch = text.match(summaryPattern);
+        if (summaryMatch && summaryMatch[1]) {
+            const years = parseFloat(summaryMatch[1]);
+            if (!isNaN(years) && years > 0 && years < 50) {
+                return `${years} years`;
+            }
+        }
+
+        // Strategy 2: Look for explicit experience mentions anywhere
         for (const pattern of this.experiencePatterns) {
-            const match = text.match(pattern);
-            if (match) {
+            const matches = text.matchAll(pattern);
+            for (const match of matches) {
                 if (match[1]) {
                     const years = parseFloat(match[1]);
-                    return `${years} years`;
+                    if (!isNaN(years) && years > 0 && years < 50) {
+                        return `${years} years`;
+                    }
                 }
             }
         }
@@ -275,34 +287,137 @@ class AIEnhancedTextExtractor {
         return sortedSkills.slice(0, isPrimary ? 8 : 6);
     }
 
-    // Find contexts where skills are mentioned
+    // Find contexts where skills are mentioned with improved accuracy
     findSkillContexts(text, skill) {
         const contexts = [];
-        const skillRegex = new RegExp(`\\b${this.escapeRegex(skill)}\\b`, 'gi');
-        let match;
+        
+        // Special handling for single-letter skills like 'R'
+        if (skill.length === 1) {
+            // Look for skill mentions in skills or technologies sections
+            const skillSectionPattern = /(?:skills?|technologies?|tech\s+stack)[^\n]*(?:\n[^\n]*){0,10}/gi;
+            const sections = text.match(skillSectionPattern) || [];
+            
+            for (const section of sections) {
+                const singleLetterSkillPattern = new RegExp(`\\b${skill}\\b(?!\\w)`, 'gi');
+                if (singleLetterSkillPattern.test(section)) {
+                    contexts.push(section);
+                }
+            }
+            return contexts;
+        }
 
+        // For normal skills, use word boundary matching
+        try {
+            const skillRegex = new RegExp(`\\b${this.escapeRegex(skill)}\\b`, 'gi');
+            let match;
+            while ((match = skillRegex.exec(text)) !== null) {
+                // Get surrounding context (50 chars before and after)
+                const start = Math.max(0, match.index - 50);
+                const end = Math.min(text.length, match.index + skill.length + 50);
+                
+                // Get the full line or section where skill is mentioned
+                const context = text.substring(start, end);
+                
+                // Validate the context to avoid false positives
+                if (this.isValidSkillContext(context, skill)) {
+                    contexts.push(context);
+                }
+            }
+        } catch (err) {
+            logger.warn(`Error in skill context extraction for ${skill}:`, err);
+            // Fallback for problematic patterns
+            const safe = skill.replace(/[^a-zA-Z0-9]/g, ' ').trim();
+            if (!safe) return contexts;
+            
+            const lines = text.split('\n');
+            for (const line of lines) {
+                if (line.toLowerCase().includes(safe.toLowerCase()) && 
+                    this.isValidSkillContext(line, skill)) {
+                    contexts.push(line);
+                }
+            }
+        }
+
+        let match;
         while ((match = skillRegex.exec(text)) !== null) {
             const start = Math.max(0, match.index - 50);
-            const end = Math.min(text.length, match.index + skill.length + 50);
+            const end = Math.min(text.length, match.index + (match[0] ? match[0].length : skill.length) + 50);
             contexts.push(text.substring(start, end));
         }
 
         return contexts;
     }
 
+    // Validate if a context is a genuine skill mention
+    isValidSkillContext(context, skill) {
+        const contextLower = context.toLowerCase();
+        const skillLower = skill.toLowerCase();
+
+        // Skip if the skill is part of an email address or URL
+        if (/@/.test(context) || /http/.test(context)) {
+            return false;
+        }
+
+        // Check if it's in a relevant section
+        const skillSectionIndicators = [
+            'skills', 'technologies', 'tech stack', 'tools', 'programming',
+            'languages', 'frameworks', 'expertise', 'proficient in',
+            'experience with', 'working with', 'knowledge of'
+        ];
+
+        const isInSkillSection = skillSectionIndicators.some(indicator => 
+            contextLower.includes(indicator.toLowerCase()));
+
+        // For single-letter skills (like 'R'), require stronger validation
+        if (skill.length === 1) {
+            return isInSkillSection && 
+                   new RegExp(`\\b${skill}\\b(?!\\w)`, 'i').test(context) &&
+                   !context.match(/[A-Z]\.[A-Z]/); // Avoid matching initials
+        }
+
+        // For normal skills, check common patterns
+        return isInSkillSection || 
+               contextLower.includes(`${skillLower} development`) ||
+               contextLower.includes(`${skillLower} programming`) ||
+               contextLower.includes(`using ${skillLower}`) ||
+               contextLower.includes(`with ${skillLower}`) ||
+               /\b(experienced|expert|proficient)\s+in/.test(contextLower);
+    }
+
     // Calculate skill relevance score based on context
     calculateSkillScore(contexts, skill) {
-        let score = contexts.length; // Base score on frequency
+        let score = 0;
 
         contexts.forEach(context => {
-            // Boost score if mentioned in relevant sections
-            if (context.includes('skill') || context.includes('technology') || 
-                context.includes('experience') || context.includes('proficient')) {
+            // Base score for each valid mention
+            score += 1;
+
+            const contextLower = context.toLowerCase();
+            
+            // Boost score based on context quality
+            if (contextLower.includes('expert in') || 
+                contextLower.includes('specialist') ||
+                contextLower.includes('advanced')) {
+                score += 3;
+            }
+            
+            // Boost if in skills section
+            if (contextLower.includes('skills') || 
+                contextLower.includes('technologies') || 
+                contextLower.includes('tech stack')) {
                 score += 2;
             }
 
-            // Boost if mentioned with years
-            if (/\d+\s*years?/.test(context)) {
+            // Boost if mentioned with experience
+            if (/\d+\s*years?/.test(context) || 
+                contextLower.includes('experience')) {
+                score += 2;
+            }
+
+            // Boost if appears in project descriptions
+            if (contextLower.includes('project') || 
+                contextLower.includes('developed') ||
+                contextLower.includes('implemented')) {
                 score += 1;
             }
         });
@@ -396,7 +511,7 @@ class AIEnhancedTextExtractor {
         educationPatterns.forEach(pattern => {
             let match;
             while ((match = pattern.exec(text)) !== null) {
-                const education = match[1] || match[3] || match[0];
+                const education = (match && (match[1] || match[3] || match[0])) || '';
                 if (education && education.trim().length > 10) {
                     educationEntries.add(education.trim().substring(0, 100));
                 }

@@ -5,7 +5,8 @@ const docx = require('docx');
 const textract = require('textract');
 const { v4: uuidv4 } = require('uuid');
 const logger = require('../utils/logger');
-const aiExtractor = require('../utils/textExtractor');
+const aiExtractor = require('./aiResumeExtractor');  // ✅ Correct path!
+
 
 // In-memory storage for candidates (in production, use a database)
 let candidatesStorage = [];
@@ -48,7 +49,8 @@ class ResumeParserService {
             logger.info(`Extracted text preview: ${extractedText.substring(0, 200)}...`);
 
             // Parse candidate information with improved logic
-            const candidateData = this.extractCandidateInfo(extractedText, extractAdditionalFields);
+            //const candidateData = this.extractCandidateInfo(extractedText, extractAdditionalFields);
+            const candidateData = await this.extractCandidateInfoWithAI(extractedText, extractAdditionalFields);
 
             // Add metadata
             candidateData.id = uuidv4();
@@ -92,11 +94,12 @@ class ResumeParserService {
         });
     }
 
-    extractCandidateInfo(text, extractAdditionalFields = false) {
+    async extractCandidateInfoWithAI(text, extractAdditionalFields = false) {
         // Clean and normalize text
         const cleanText = this.normalizeText(text);
 
-        const candidateInfo = {
+        // First get rule-based extraction
+        const ruleBasedInfo = {
             name: this.extractNameEnhanced(cleanText),
             email: this.extractEmail(cleanText),
             phone: this.extractPhone(cleanText),
@@ -106,39 +109,76 @@ class ResumeParserService {
             secondarySkills: this.extractSecondarySkills(cleanText)
         };
 
-        // Use AI extractor as a fallback for missing or low-confidence fields
         try {
-            const aiResult = aiExtractor.extractCandidateInfoAI(text, extractAdditionalFields);
-
-            // Fill missing name
-            if ((!candidateInfo.name || candidateInfo.name === 'Name Not Found') && aiResult.name) {
-                candidateInfo.name = aiResult.name;
+            // Get AI-based extraction
+            const aiResult = await aiExtractor.extractCandidateInfoAI(text, extractAdditionalFields);
+            
+            if (!aiResult) {
+                logger.warn('AI extraction returned null, using rule-based results');
+                return ruleBasedInfo;
             }
 
-            // Merge primary skills if rule-based found none or very few
-            if ((!candidateInfo.primarySkills || candidateInfo.primarySkills.length === 0) && aiResult.primarySkills) {
-                candidateInfo.primarySkills = aiResult.primarySkills;
+            // Merge results with preference to AI results for most fields
+            const mergedInfo = {
+                // Prefer AI name unless it's empty/null
+                name: aiResult.name || ruleBasedInfo.name,
+                
+                // For email and phone, use rule-based if they match email/phone patterns
+                // otherwise prefer AI results
+                email: this.isValidEmail(ruleBasedInfo.email) ? ruleBasedInfo.email : aiResult.email,
+                phone: this.isValidPhone(ruleBasedInfo.phone) ? ruleBasedInfo.phone : aiResult.phone,
+                
+                // For experience, use AI if it provides a reasonable number
+                experience: this.isValidExperience(aiResult.experience) ? aiResult.experience : ruleBasedInfo.experience,
+                
+                // For LinkedIn, use whichever contains a valid LinkedIn URL
+                linkedinUrl: this.isValidLinkedIn(ruleBasedInfo.linkedinUrl) ? ruleBasedInfo.linkedinUrl : aiResult.linkedinUrl,
+                
+                // Combine and deduplicate skills, with AI skills taking precedence
+                primarySkills: this.mergeAndDedupSkills(aiResult.primarySkills, ruleBasedInfo.primarySkills, 8),
+                secondarySkills: this.mergeAndDedupSkills(aiResult.secondarySkills, ruleBasedInfo.secondarySkills, 8)
+            };
+
+            // Handle additional fields if requested
+            if (extractAdditionalFields) {
+                const ruleBasedAdditional = this.extractAdditionalFields(cleanText);
+                mergedInfo.additionalFields = {
+                    ...ruleBasedAdditional,
+                    ...(aiResult.additionalFields || {}),
+                };
             }
 
-            // Merge secondary skills similarly
-            if ((!candidateInfo.secondarySkills || candidateInfo.secondarySkills.length === 0) && aiResult.secondarySkills) {
-                candidateInfo.secondarySkills = aiResult.secondarySkills;
-            }
+            return mergedInfo;
 
-            // If additional fields requested, merge AI additionalFields
-            if (extractAdditionalFields && aiResult.additionalFields) {
-                candidateInfo.additionalFields = candidateInfo.additionalFields || {};
-                candidateInfo.additionalFields = Object.assign({}, aiResult.additionalFields, candidateInfo.additionalFields);
-            }
-        } catch (e) {
-            logger.warn('AI extractor failed or returned error, proceeding with rule-based results');
+        } catch (error) {
+            logger.warn('AI extraction failed, falling back to rule-based results:', error.message);
+            return ruleBasedInfo;
         }
+    }
 
-        if (extractAdditionalFields) {
-            candidateInfo.additionalFields = this.extractAdditionalFields(cleanText);
-        }
+    // Helper methods for validation
+    isValidEmail(email) {
+        return email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    }
 
-        return candidateInfo;
+    isValidPhone(phone) {
+        return phone && /^[\d\+\-\(\)\s]{10,20}$/.test(phone);
+    }
+
+    isValidExperience(experience) {
+        if (!experience) return false;
+        const years = parseFloat(experience.replace(/[^\d.]/g, ''));
+        return !isNaN(years) && years >= 0 && years < 50;
+    }
+
+    isValidLinkedIn(url) {
+        return url && url.toLowerCase().includes('linkedin.com/in/');
+    }
+
+    mergeAndDedupSkills(aiSkills = [], ruleBasedSkills = [], limit = 8) {
+        // Convert to Set to remove duplicates, prioritizing AI skills
+        const skillSet = new Set([...aiSkills, ...ruleBasedSkills]);
+        return Array.from(skillSet).slice(0, limit);
     }
 
     normalizeText(text) {
@@ -442,61 +482,97 @@ class ResumeParserService {
         return null;
     }
 
-    extractPrimarySkills(text) {
-        const primarySkillKeywords = [
-            // Programming languages (high priority)
-            'JavaScript', 'Python', 'Java', 'C++', 'C#', 'PHP', 'Ruby', 'Go', 'Rust', 'TypeScript',
-            'Swift', 'Kotlin', 'Scala', 'R', 'MATLAB', 'SQL', 'Dart', 'Objective-C',
+    async extractPrimarySkills(text) {
+        try {
+            const prompt = `Analyze the following resume text and extract ONLY the technical skills that are explicitly mentioned or listed in the text.
+Do NOT infer, assume, or add any skills that are not directly and plainly visible in the resume itself.
 
-            // Web technologies
-            'React', 'Angular', 'Vue.js', 'Vue', 'Node.js', 'Express', 'Django', 'Flask', 'Spring',
-            'ASP.NET', 'Laravel', 'Rails', 'HTML', 'CSS', 'Bootstrap', 'Tailwind',
+Focus strictly on these categories:
 
-            // Mobile development
-            'React Native', 'Flutter', 'Xamarin', 'iOS', 'Android',
+Programming languages
 
-            // Databases
-            'MySQL', 'PostgreSQL', 'MongoDB', 'Redis', 'Cassandra', 'Oracle', 'SQL Server',
+Web technologies
 
-            // Cloud platforms
-            'AWS', 'Azure', 'GCP', 'Google Cloud', 'Heroku',
+Mobile development
 
-            // DevOps tools
-            'Docker', 'Kubernetes', 'Jenkins', 'Terraform', 'Ansible',
+Databases
 
-            // SAP specific
-            'SAP', 'SAP ISU', 'SAP FICA'
-        ];
+Cloud platforms
 
-        return this.findSkillsInText(text, primarySkillKeywords).slice(0, 8);
+DevOps tools
+
+Testing or QA tools and technologies (✅ include Manual Testing, Postman, JIRA, SAP GUI, or similar if explicitly listed)
+
+CRM tools and platforms (✅ include SAP CRM, SAP C4C, Oracle CRM, Microsoft Dynamics, Salesforce, etc., if explicitly listed)Analyze the following resume text and extract ONLY the technical skills that are explicitly mentioned or listed in the text.
+Do NOT infer, assume, or add any skills that are not directly and plainly visible in the resume itself.
+
+Focus strictly on these categories:
+
+Programming languages
+
+Web technologies
+
+Mobile development
+
+Databases
+
+Cloud platforms
+
+DevOps tools
+
+Testing or QA tools and technologies (✅ include Manual Testing, Postman, JIRA, SAP GUI, or similar if explicitly listed)
+
+CRM tools and platforms (✅ include SAP CRM, SAP C4C, Oracle CRM, Microsoft Dynamics, Salesforce, etc., if explicitly listed).
+
+Extraction Rules:
+
+Return a JSON array of at most 8 unique skills, exactly as they appear in the resume, and in the order they appear.
+
+Preserve the original capitalization and spelling from the resume.
+
+Include skills listed under headings such as “Skills,” “Technical Skills,” “Tools,” “Technologies,” “CRM Tools,” or similar.
+
+Do NOT infer technologies from project descriptions unless they are explicitly named as tools, platforms, or technologies.
+
+Exclude soft skills, methodologies, or general processes (e.g., exclude Agile, include JIRA).
+
+Do NOT merge, split, or reformat skill names — keep them exactly as written in the resume.
+
+CRM systems from SAP, Oracle, Microsoft, or Salesforce must be included only if explicitly mentioned.
+                          
+                          Resume text:
+                          ${text.substring(0, 2000)}`;
+            
+            const result = await aiExtractor.quickAnalyze(prompt);
+            const skills = JSON.parse(result);
+            return Array.isArray(skills) ? skills.slice(0, 8) : [];
+        } catch (error) {
+            logger.warn('AI primary skills extraction failed:', error);
+            return [];
+        }
     }
 
-    extractSecondarySkills(text) {
-        const secondarySkillKeywords = [
-            // Version control & collaboration
-            'Git', 'GitHub', 'GitLab', 'Bitbucket', 'SVN',
-
-            // Project management & tools
-            'JIRA', 'Confluence', 'Slack', 'Trello', 'Asana', 'ServiceNow',
-
-            // Design tools
-            'Photoshop', 'Illustrator', 'Figma', 'Sketch', 'InVision', 'Adobe XD',
-
-            // Methodologies
-            'Agile', 'Scrum', 'Kanban', 'DevOps', 'CI/CD', 'TDD', 'BDD',
-
-            // Testing
-            'JUnit', 'Jest', 'Cypress', 'Selenium', 'Postman', 'TestNG', 'Manual Testing',
-
-            // Data Science & ML
-            'TensorFlow', 'PyTorch', 'Pandas', 'NumPy', 'Scikit-learn', 'Tableau',
-            'Power BI', 'Matplotlib', 'Keras',
-
-            // Others
-            'REST API', 'GraphQL', 'Microservices', 'SOAP', 'JSON', 'XML'
-        ];
-
-        return this.findSkillsInText(text, secondarySkillKeywords).slice(0, 8);
+    async extractSecondarySkills(text) {
+        try {
+            const prompt = `Analyze this resume text and extract secondary technical skills, focusing on:
+                          1. Version control & collaboration tools
+                          2. Project management tools
+                          3. Design tools
+                          4. Methodologies
+                          5. Testing tools
+                          6. Data science & ML tools
+                          Return only a JSON array of strings with the top 8 most relevant secondary skills.
+                          
+                          Resume text:
+                          ${text.substring(0, 2000)}`;
+            
+            const result = await aiExtractor.quickAnalyze(prompt);
+            const skills = JSON.parse(result);
+            return Array.isArray(skills) ? skills.slice(0, 8) : [];
+        } catch (error) {
+            logger.warn('AI secondary skills extraction failed:', error);
+            return [];
+        }
     }
 
     findSkillsInText(text, skillKeywords) {
@@ -610,24 +686,42 @@ class ResumeParserService {
         return null;
     }
 
-    extractCertifications(text) {
-        const certificationKeywords = [
-            'AWS Certified', 'Google Cloud', 'Microsoft Certified', 'Cisco',
-            'PMP', 'CISSP', 'CISM', 'CEH', 'OSCP', 'CompTIA', 'Oracle Certified',
-            'Salesforce', 'Adobe Certified', 'Red Hat', 'VMware'
-        ];
-
-        return this.findSkillsInText(text, certificationKeywords);
+    async extractCertifications(text) {
+        try {
+            const prompt = `Analyze this resume text and extract all professional certifications.
+                          Look for any technical, professional, or industry certifications.
+                          Return only a JSON array of certification names.
+                          If no certifications are found, return an empty array.
+                          
+                          Resume text:
+                          ${text.substring(0, 2000)}`;
+            
+            const result = await aiExtractor.quickAnalyze(prompt);
+            const certifications = JSON.parse(result);
+            return Array.isArray(certifications) ? certifications : [];
+        } catch (error) {
+            logger.warn('AI certifications extraction failed:', error);
+            return [];
+        }
     }
 
-    extractLanguages(text) {
-        const languageKeywords = [
-            'English', 'Spanish', 'French', 'German', 'Chinese', 'Japanese',
-            'Korean', 'Italian', 'Portuguese', 'Russian', 'Arabic', 'Hindi',
-            'Telugu', 'Tamil', 'Bengali', 'Marathi', 'Gujarati', 'Kannada'
-        ];
-
-        return this.findSkillsInText(text, languageKeywords);
+    async extractLanguages(text) {
+        try {
+            const prompt = `Analyze this resume text and extract all languages the candidate knows.
+                          Include only human languages (not programming languages).
+                          Return only a JSON array of language names.
+                          If no languages are mentioned, return an empty array.
+                          
+                          Resume text:
+                          ${text.substring(0, 2000)}`;
+            
+            const result = await aiExtractor.quickAnalyze(prompt);
+            const languages = JSON.parse(result);
+            return Array.isArray(languages) ? languages : [];
+        } catch (error) {
+            logger.warn('AI languages extraction failed:', error);
+            return [];
+        }
     }
 
     extractProjects(text) {
