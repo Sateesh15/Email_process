@@ -20,6 +20,7 @@
   "dependencies": {
     "cors": "^2.8.5",
     "docx": "^8.5.0",
+    "dotenv": "^17.2.3",
     "exceljs": "^4.4.0",
     "express": "^4.18.2",
     "fs-extra": "^11.1.1",
@@ -27,10 +28,11 @@
     "mailparser": "^3.6.5",
     "multer": "^1.4.5-lts.1",
     "natural": "^8.1.0",
+    "openai": "^4.104.0",
     "path": "^0.12.7",
     "pdf-parse": "^1.1.1",
     "pdfkit": "^0.15.0",
-    "textract": "^2.5.0",
+    "textract": "^0.20.0",
     "uuid": "^9.0.1",
     "winston": "^3.11.0"
   },
